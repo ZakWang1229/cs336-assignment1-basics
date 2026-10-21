@@ -5,140 +5,133 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 const MAX_VOCAB_SIZE: usize = 65535;
-const MINIMAL_MERGE_CNT: usize = 1; // if for large train text, we don't care the unfrequent pairs
-const PRETOKENIZE_PAT: &str =
-    r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+const PRETOKENIZE_PAT: &str = r"'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+";
+
+macro_rules! py_bail {
+    ($exception:ident, $($message:tt)+) => {
+        return Err(pyo3::exceptions::$exception::new_err(format!($($message)+)))
+    };
+}
 
 type Pair = (u16, u16);
 
 struct Chain {
-    pre: Vec<usize>,
-    nxt: Vec<usize>,
+    pre: Vec<u32>,
+    nxt: Vec<u32>,
 }
 impl Chain {
     fn new(size: usize) -> Self {
-        Self {
-            pre: vec![size; size],
-            nxt: vec![size; size],
-        }
+        let end = size as u32;
+        Self { pre: vec![end; size], nxt: vec![end; size] }
     }
-
-    fn erase(&mut self, pos: usize) {
-        let end = self.pre.len();
+    fn erase(&mut self, pos: usize)  {
+        let len = self.pre.len();
+        let end = len as u32;
         let left = self.pre[pos];
         let right = self.nxt[pos];
-        if left != end {
-            self.nxt[left] = right;
-        }
-        if right != end {
-            self.pre[right] = left;
-        }
+        if left != end { self.nxt[left as usize] = right; }
+        if right != end { self.pre[right as usize] = left; }
         self.pre[pos] = end;
         self.nxt[pos] = end;
     }
 }
 
-// Every pair occurrence is identified by its right token's buffer position.
 struct PairIndex {
+    minimal_merge_cnt: usize,
     len: usize,
     chain: Chain,
-    counts: HashMap<Pair, (usize, usize)>, // count, occurrence-list head
-    tails: HashMap<Pair, usize>,
-    candidates: HashSet<Pair>,             // stable identities, not mutable head positions
+    pair_info: HashMap<Pair, (usize, u32)>, // count, tail
+    candidates: HashSet<Pair>,
 }
 impl PairIndex {
-    fn new(size: usize) -> Self {
+    fn new(size: usize, minimal_merge_cnt: usize) -> Self {
         Self {
+            minimal_merge_cnt,
             len: size,
             chain: Chain::new(size),
-            counts: HashMap::new(),
-            tails: HashMap::new(),
+            pair_info: HashMap::new(),
             candidates: HashSet::new(),
         }
     }
 
-    fn insert(&mut self, pair: Pair, pos: usize) {
-        let entry = self.counts.entry(pair).or_insert((0, self.len));
-        let tail = self.tails.entry(pair).or_insert(self.len);
-        self.chain.pre[pos] = *tail;
-        self.chain.nxt[pos] = self.len;
-        if *tail != self.len {
-            debug_assert!(*tail < pos, "pair occurrences must be appended in text order");
-            self.chain.nxt[*tail] = pos;
-        } else {
-            entry.1 = pos;
+    fn insert(&mut self, pair: Pair, pos: usize, frequency: usize)  {
+        let pos_u32 = pos as u32;
+        let entry = self.pair_info.entry(pair).or_insert((0, self.len as u32));
+        let tail = entry.1;
+        self.chain.pre[pos] = tail;
+        self.chain.nxt[pos] = self.len as u32;
+        if tail != self.len as u32 {
+            debug_assert!(tail < pos_u32, "pair occurrences must be appended in text order");
+            self.chain.nxt[tail as usize] = pos_u32;
         }
-        *tail = pos;
-        entry.0 += 1;
-        if entry.0 >= MINIMAL_MERGE_CNT { self.candidates.insert(pair); }
+        entry.1 = pos_u32;
+        let old_count = entry.0;
+        entry.0 += frequency;
+        if old_count < self.minimal_merge_cnt && entry.0 >= self.minimal_merge_cnt {
+            self.candidates.insert(pair);
+        }
     }
 
-    fn erase(&mut self, pair: Pair, pos: usize) {
-        let entry = self
-            .counts
-            .get_mut(&pair)
-            .expect("pair occurrence must exist");
-        if entry.1 == pos { entry.1 = self.chain.nxt[pos]; }
-        if self.tails[&pair] == pos {
-            self.tails.insert(pair, self.chain.pre[pos]);
-        }
-        entry.0 -= 1;
-        if entry.0 < MINIMAL_MERGE_CNT || entry.0 == 0 { self.candidates.remove(&pair); }
+    fn erase(&mut self, pair: Pair, pos: usize, frequency: usize)  {
+        let pos_u32 = pos as u32;
+        let entry = self.pair_info.get_mut(&pair).expect("pair occurrence must exist");
+        let previous = self.chain.pre[pos];
         self.chain.erase(pos);
-        if entry.0 == 0 {
-            self.counts.remove(&pair);
-            self.tails.remove(&pair);
+        if entry.1 == pos_u32 { entry.1 = previous; }
+        let old_count = entry.0;
+        entry.0 -= frequency;
+        if old_count >= self.minimal_merge_cnt && entry.0 < self.minimal_merge_cnt {
+            self.candidates.remove(&pair);
         }
+        if entry.0 == 0 { self.pair_info.remove(&pair); }
     }
 }
 
-/// Train a byte-level BPE vocabulary and return Python bytes objects.
 #[pyfunction]
-#[pyo3(signature = (input_path, vocab_size, special_tokens, **kwargs))]
+#[pyo3(signature = (input_path, vocab_size, special_tokens, *, minimal_merge_cnt = 1, **kwargs))]
 fn train_bpe(
     py: Python<'_>,
     input_path: PathBuf,
     vocab_size: usize,
     special_tokens: Vec<String>,
+    minimal_merge_cnt: usize,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<Py<PyAny>> {
     let _ = kwargs;
-    let mut specials = Vec::new();
-    for token in special_tokens {
-        if token.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "special tokens must not be empty",
-            ));
-        }
-        if !specials.contains(&token) {
-            specials.push(token);
-        }
+    if minimal_merge_cnt == 0 {
+        py_bail!(PyValueError, "minimal_merge_cnt must be positive");
     }
-    if vocab_size < 256 + specials.len() || vocab_size > MAX_VOCAB_SIZE {
-        return Err(pyo3::exceptions::PyValueError::new_err(
-            "invalid vocabulary size",
-        ));
+    let mut special_tokens_unique = Vec::new();
+    for token in special_tokens {
+        if token.is_empty() { py_bail!(PyValueError, "special tokens must not be empty"); }
+        if !special_tokens_unique.contains(&token) { special_tokens_unique.push(token); }
+    }
+    if vocab_size < 256 + special_tokens_unique.len() || vocab_size > MAX_VOCAB_SIZE {
+        py_bail!(PyValueError, "invalid vocabulary size");
     }
     let text = std::fs::read_to_string(input_path)
         .map_err(|error| pyo3::exceptions::PyIOError::new_err(error.to_string()))?;
-    let mut buff = pretokenlize(&text, specials.clone());
+    let (mut buff, position_frequencies) = pretokenlize(&text, &special_tokens_unique)
+        .map_err(|_| pyo3::exceptions::PyOverflowError::new_err("word frequency exceeds u32::MAX"))?;
+    drop(text);
     let end = buff.len();
+    if end >= u32::MAX as usize {
+        py_bail!(PyValueError, "buffer is too large for u32 pair positions");
+    }
     let mut pos_chain = Chain::new(end);
-    let mut pair_index = PairIndex::new(end);
+    let mut pair_index = PairIndex::new(end, minimal_merge_cnt);
     let mut vocab_map: Vec<Vec<u8>> = (0..=255).map(|byte| vec![byte]).collect();
     let mut vocab_merge = Vec::<(Vec<u8>, Vec<u8>)>::new();
     for pos in 1..end {
         if buff[pos - 1] != MAX_VOCAB_SIZE as u16 && buff[pos] != MAX_VOCAB_SIZE as u16 {
-            pos_chain.pre[pos] = pos - 1;
-            pos_chain.nxt[pos - 1] = pos;
-            pair_index.insert((buff[pos - 1], buff[pos]), pos);
+            pos_chain.pre[pos] = (pos - 1) as u32;
+            pos_chain.nxt[pos - 1] = pos as u32;
+            pair_index.insert((buff[pos - 1], buff[pos]), pos, position_frequencies[pos] as usize);
         }
     }
-    while vocab_map.len() + specials.len() < vocab_size {
+    while vocab_map.len() + special_tokens_unique.len() < vocab_size {
         let selected = pair_index.candidates.iter().copied().max_by(|a, b| {
-            pair_index.counts[a]
-                .0
-                .cmp(&pair_index.counts[b].0)
+            pair_index.pair_info[a].0.cmp(&pair_index.pair_info[b].0)
                 .then_with(|| vocab_map[a.0 as usize].cmp(&vocab_map[b.0 as usize]))
                 .then_with(|| vocab_map[a.1 as usize].cmp(&vocab_map[b.1 as usize]))
         });
@@ -152,30 +145,33 @@ fn train_bpe(
         vocab_map.push(merged);
         vocab_merge.push((left, right));
 
-        let mut positions = Vec::with_capacity(pair_index.counts[&selected].0);
-        let mut pos = pair_index.counts[&selected].1;
-        while pos != end {
+        let mut positions = Vec::new();
+        let mut pos = pair_index.pair_info[&selected].1 as usize;
+        positions.push(pos);
+        while pair_index.chain.pre[pos as usize] != pair_index.len as u32 {
+            pos = pair_index.chain.pre[pos] as usize;
             positions.push(pos);
-            pos = pair_index.chain.nxt[pos];
         }
+        positions.reverse();
         debug_assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         for pos2 in positions {
-            let pos1 = pos_chain.pre[pos2];
+            let pos1 = pos_chain.pre[pos2] as usize;
             if pos1 == end || (buff[pos1], buff[pos2]) != selected { continue; }
-            let pre_pos = pos_chain.pre[pos1];
-            let nxt_pos = pos_chain.nxt[pos2];
+            let frequency = position_frequencies[pos2] as usize;
+            let pre_pos = pos_chain.pre[pos1] as usize;
+            let nxt_pos = pos_chain.nxt[pos2] as usize;
 
-            if pre_pos != end { pair_index.erase((buff[pre_pos], buff[pos1]), pos1); }
-            pair_index.erase(selected, pos2);
-            if nxt_pos != end { pair_index.erase((buff[pos2], buff[nxt_pos]), nxt_pos); }
+            if pre_pos != end { pair_index.erase((buff[pre_pos], buff[pos1]), pos1, frequency); }
+            pair_index.erase(selected, pos2, frequency);
+            if nxt_pos != end { pair_index.erase((buff[pos2], buff[nxt_pos]), nxt_pos, frequency); }
 
             buff[pos2] = token_id;
             pos_chain.erase(pos1);
-            if pre_pos != end { pair_index.insert((buff[pre_pos], token_id), pos2); }
-            if nxt_pos != end { pair_index.insert((token_id, buff[nxt_pos]), nxt_pos); }
+            if pre_pos != end { pair_index.insert((buff[pre_pos], token_id), pos2, frequency); }
+            if nxt_pos != end { pair_index.insert((token_id, buff[nxt_pos]), nxt_pos, frequency); }
         }
     }
-    vocab_map.extend(specials.into_iter().map(String::into_bytes));
+    vocab_map.extend(special_tokens_unique.into_iter().map(String::into_bytes));
 
     let vocab_py = PyDict::new(py);
     for (token_id, token_bytes) in vocab_map.iter().enumerate() {
@@ -189,37 +185,37 @@ fn train_bpe(
     Ok(result.into_any().unbind())
 }
 
-fn pretokenlize(s: &str, special_tokens: Vec<String>) -> Vec<u16> {
-    let mut pos = 0usize;
-    let mut text_vec = Vec::<&str>::new();
+fn pretokenlize(s: &str, special_tokens: &[String]) -> Result<(Vec<u16>, Vec<u32>), std::num::TryFromIntError> {
+    let re = Regex::new(PRETOKENIZE_PAT).expect("pattern should compile");
+    let mut words = HashMap::<&[u8], usize>::new();
+    let mut pos = 0;
     while pos < s.len() {
         let mut end = s.len();
-        let mut pos1 = s.len();
-        let s_from_pos = &s[pos..];
-        for pat in special_tokens.iter().map(String::as_str) {
-            if let Some(x) = s_from_pos.find(pat) {
-                let x_in_s = pos + x;
-                if x_in_s < end || (x_in_s == end && x_in_s + pat.len() < pos1) {
-                    end = x_in_s;
-                    pos1 = x_in_s + pat.len();
+        let mut next = s.len();
+        for pat in special_tokens {
+            if let Some(relative) = s[pos..].find(pat.as_str()) {
+                let start = pos + relative;
+                if start < end || (start == end && start + pat.len() < next) {
+                    end = start;
+                    next = start + pat.len();
                 }
             }
         }
-        text_vec.push(&s[pos..end]);
-        pos = pos1;
-    }
-
-    let re = Regex::new(PRETOKENIZE_PAT).expect("pattern should compile");
-    let mut buff = vec![MAX_VOCAB_SIZE as u16];
-    for text in text_vec {
-        for res in re.find_iter(text) {
-            let slice = res.expect("matching should succeed").as_str().as_bytes();
-            buff.extend(slice.iter().map(|v| *v as u16));
-            buff.push(MAX_VOCAB_SIZE as u16);
+        for matched in re.find_iter(&s[pos..end]) {
+            let word = matched.expect("matching should succeed").as_str().as_bytes();
+            *words.entry(word).or_default() += 1;
         }
+        pos = next;
     }
-
-    return buff;
+    let mut buff = vec![MAX_VOCAB_SIZE as u16];
+    let mut position_frequencies = vec![0u32];
+    for (word, frequency) in words {
+        let frequency = u32::try_from(frequency)?;
+        buff.extend(word.iter().map(|&byte| byte as u16));
+        buff.push(MAX_VOCAB_SIZE as u16);
+        position_frequencies.resize(buff.len(), frequency);
+    }
+    Ok((buff, position_frequencies))
 }
 
 /// Python extension entry point. Register your Rust functions here.
@@ -249,26 +245,56 @@ mod tests {
         assert_eq!(pieces.concat(), text);
     }
     #[test]
-    fn pair_index_updates_head_and_unlinks_middle_and_tail() {
+    fn pair_index_updates_tail_and_unlinks_occurrences() {
         let pair = (1, 2);
-        let mut index = PairIndex::new(10);
+        let mut index = PairIndex::new(10, 1);
         for pos in [1, 3, 5] {
-            index.insert(pair, pos);
+            index.insert(pair, pos, 1);
         }
-        index.erase(pair, 3);
-        assert_eq!(index.counts[&pair], (2, 1));
+        index.erase(pair, 3, 1);
+        assert_eq!(index.pair_info[&pair], (2, 5));
         assert_eq!(index.chain.nxt[1], 5);
         assert_eq!(index.chain.pre[5], 1);
-        assert_eq!(index.tails[&pair], 5);
-        index.erase(pair, 5);
-        assert_eq!(index.tails[&pair], 1);
-        assert_eq!(index.counts[&pair], (1, 1));
+        assert_eq!(index.pair_info[&pair].1, 5);
+        index.erase(pair, 5, 1);
+        assert_eq!(index.pair_info[&pair].1, 1);
+        assert_eq!(index.pair_info[&pair], (1, 1));
         assert_eq!(index.chain.pre[1], 10);
-        index.erase(pair, 1);
-        assert!(!index.counts.contains_key(&pair));
+        index.erase(pair, 1, 1);
+        assert!(!index.pair_info.contains_key(&pair));
         assert!(!index.candidates.contains(&pair));
-        index.insert((3, 4), 1);
+        index.insert((3, 4), 1, 1);
         assert_eq!(index.chain.pre[1], 10);
         assert_eq!(index.chain.nxt[1], 10);
     }
+    #[test]
+    fn repeated_words_share_buffer_and_preserve_frequency() {
+        let specials = vec!["<|endoftext|>".to_string()];
+        let (buff, frequencies) = pretokenlize(
+            "abab<|endoftext|>abab<|endoftext|>abab", &specials,
+        ).unwrap();
+        assert_eq!(buff, vec![65535, 97, 98, 97, 98, 65535]);
+        assert_eq!(frequencies, vec![0, 3, 3, 3, 3, 3]);
+        assert_eq!(frequencies.len(), buff.len());
+        let mut index = PairIndex::new(buff.len(), 1);
+        index.insert((97, 98), 2, frequencies[2] as usize);
+        index.insert((97, 98), 4, frequencies[4] as usize);
+        assert_eq!(index.pair_info[&(97, 98)].0, 6);
+        index.erase((97, 98), 2, frequencies[2] as usize);
+        assert_eq!(index.pair_info[&(97, 98)].0, 3);
+    }
+
+    #[test]
+    fn weighted_updates_can_jump_across_candidate_threshold() {
+        let pair = (1, 2);
+        let mut index = PairIndex::new(10, 5);
+        index.insert(pair, 1, 3);
+        assert!(!index.candidates.contains(&pair));
+        index.insert(pair, 3, 4);
+        assert!(index.candidates.contains(&pair));
+        index.erase(pair, 3, 4);
+        assert_eq!(index.pair_info[&pair].0, 3);
+        assert!(!index.candidates.contains(&pair));
+    }
+
 }

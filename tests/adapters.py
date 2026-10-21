@@ -591,4 +591,4 @@ def run_train_bpe(
     """
     from cs336_basics._rust import train_bpe
 
-    return train_bpe(os.fspath(input_path), vocab_size, special_tokens, **kwargs)
+    return train_bpe(os.fspath(input_path), vocab_size, special_tokens, minimal_merge_cnt=100, **kwargs)
