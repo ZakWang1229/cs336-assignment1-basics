@@ -559,7 +559,9 @@ def get_tokenizer(
     Returns:
         A BPE tokenizer that uses the provided vocab, merges, and special tokens.
     """
-    raise NotImplementedError
+    from cs336_basics._rust import Tokenlizer
+
+    return Tokenlizer.form_vocab(vocab, merges, special_tokens)
 
 
 def run_train_bpe(
@@ -591,4 +593,4 @@ def run_train_bpe(
     """
     from cs336_basics._rust import train_bpe
 
-    return train_bpe(os.fspath(input_path), vocab_size, special_tokens, minimal_merge_cnt=100, **kwargs)
+    return train_bpe(os.fspath(input_path), vocab_size, special_tokens, minimal_merge_cnt=1, **kwargs)
